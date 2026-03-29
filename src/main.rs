@@ -1,13 +1,13 @@
 use bdk_electrum::electrum_client::Client;
 use bdk_electrum::{BdkElectrumClient, electrum_client};
-use bdk_wallet::KeychainKind;
 use bdk_wallet::PersistedWallet;
 use bdk_wallet::Wallet;
-use bdk_wallet::bitcoin::{Network, bip32};
+use bdk_wallet::bitcoin::{Address, Amount, Network, bip32};
 use bdk_wallet::chain::spk_client::{SyncRequest, SyncRequestBuilder};
 use bdk_wallet::keys::{GeneratableKey, GeneratedKey};
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{AddressInfo, miniscript};
+use bdk_wallet::{KeychainKind, LocalOutput};
 use std::path::Path;
 
 const STOP_GAP: usize = 50;
@@ -29,30 +29,20 @@ fn main() -> anyhow::Result<()> {
         address.address, address.index
     );
 
-    // Create the Electrum client
-    let client: BdkElectrumClient<Client> =
-        BdkElectrumClient::new(electrum_client::Client::new(ELECTRUM_HOST).unwrap());
+    let mut lw = LocalWallet::new(wallet);
 
     // Perform the initial full scan on the wallet
-    full_scan(&mut wallet, &client);
+    lw.full_scan();
 
-    let mut prev_balance = wallet.balance();
-    println!("Wallet balance: {} sat", prev_balance.total().to_sat());
+    println!("./docker/bcli.sh generatetoaddress 1 {}", address);
+    let (prev, balance) = lw.wait_balance_change(&address);
+    println!("Wallet balance: {} --> {}", prev, balance);
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(10));
+    println!("./docker/bcli.sh generatetoaddress 1 {}", address);
+    let (prev, balance) = lw.wait_balance_change(&address);
+    println!("Wallet balance: {} --> {}", prev, balance);
 
-        sync(&mut wallet, &client);
-        let balance = wallet.balance();
-        if prev_balance != balance {
-            println!(
-                "Wallet balance changed: {} --> {} sat",
-                prev_balance.total().to_sat(),
-                balance.total().to_sat()
-            );
-            prev_balance = balance;
-        }
-    }
+    Ok(())
 }
 
 fn create_xprv(fname: &str) {
@@ -95,44 +85,99 @@ fn create_or_load_wallet(wallet_fname: &str, xprv_fname: &str) -> PersistedWalle
     wallet
 }
 
-fn full_scan(wallet: &mut PersistedWallet<Connection>, client: &BdkElectrumClient<Client>) {
-    let full_scan_request = wallet.start_full_scan();
-    let update = client
-        .full_scan(full_scan_request, STOP_GAP, BATCH_SIZE, true)
-        .unwrap();
-    wallet.apply_update(update).unwrap();
+struct LocalWallet {
+    wallet: PersistedWallet<Connection>,
+    client: BdkElectrumClient<Client>,
 }
 
-fn sync(wallet: &mut PersistedWallet<Connection>, client: &BdkElectrumClient<Client>) {
-    let sync_request = sync_request(wallet);
-    let sync_response = client.sync(sync_request, BATCH_SIZE, false).unwrap();
-    wallet.apply_update(sync_response).unwrap();
-}
-
-fn sync_request(wallet: &Wallet) -> SyncRequestBuilder<(bdk_wallet::KeychainKind, u32)> {
-    let mut spks_to_sync = std::collections::BTreeSet::new();
-
-    // Externalアドレスのみチェックする
-    if let Some(derived_index) = wallet.derivation_index(KeychainKind::External) {
-        for index in 0..=derived_index {
-            let address_info = wallet.peek_address(KeychainKind::External, index);
-            spks_to_sync.insert((
-                (KeychainKind::External, index),
-                address_info.address.script_pubkey(),
-            ));
+impl LocalWallet {
+    pub fn new(wallet: PersistedWallet<Connection>) -> Self {
+        Self {
+            wallet: wallet,
+            client: BdkElectrumClient::new(electrum_client::Client::new(ELECTRUM_HOST).unwrap()),
         }
     }
-    for tx in wallet.transactions() {
-        if tx.chain_position.is_unconfirmed() {
-            for out in &tx.tx_node.tx.output {
-                if let Some(index) = wallet.spk_index().index_of_spk(out.script_pubkey.clone()) {
-                    spks_to_sync.insert((*index, out.script_pubkey.clone()));
+
+    fn full_scan(&mut self) {
+        let full_scan_request = self.wallet.start_full_scan();
+        let update = self
+            .client
+            .full_scan(full_scan_request, STOP_GAP, BATCH_SIZE, true)
+            .unwrap();
+        self.wallet.apply_update(update).unwrap();
+    }
+
+    fn sync(&mut self) {
+        let sync_request = self.sync_request();
+        let sync_response = self.client.sync(sync_request, BATCH_SIZE, false).unwrap();
+        self.wallet.apply_update(sync_response).unwrap();
+    }
+
+    fn sync_request(&self) -> SyncRequestBuilder<(bdk_wallet::KeychainKind, u32)> {
+        let mut spks_to_sync = std::collections::BTreeSet::new();
+
+        // Externalアドレスのみチェックする
+        if let Some(derived_index) = self.wallet.derivation_index(KeychainKind::External) {
+            for index in 0..=derived_index {
+                let address_info = self.wallet.peek_address(KeychainKind::External, index);
+                spks_to_sync.insert((
+                    (KeychainKind::External, index),
+                    address_info.address.script_pubkey(),
+                ));
+            }
+        }
+        for tx in self.wallet.transactions() {
+            if tx.chain_position.is_unconfirmed() {
+                for out in &tx.tx_node.tx.output {
+                    if let Some(index) = self
+                        .wallet
+                        .spk_index()
+                        .index_of_spk(out.script_pubkey.clone())
+                    {
+                        spks_to_sync.insert((*index, out.script_pubkey.clone()));
+                    }
                 }
             }
         }
+        let chain_tip = self.wallet.local_chain().tip();
+        SyncRequest::builder()
+            .chain_tip(chain_tip)
+            .spks_with_indexes(spks_to_sync)
     }
-    let chain_tip = wallet.local_chain().tip();
-    SyncRequest::builder()
-        .chain_tip(chain_tip)
-        .spks_with_indexes(spks_to_sync)
+
+    fn get_my_balance(&self, target_address: &Address) -> Amount {
+        let confirmed_utxos_for_address: Vec<LocalOutput> = self
+            .wallet
+            .list_unspent()
+            .filter(|utxo| {
+                // 確認済みかつ対象アドレスのUTXOをフィルタ
+                utxo.chain_position.is_confirmed()
+                    && utxo.txout.script_pubkey == target_address.script_pubkey()
+            })
+            .collect();
+
+        confirmed_utxos_for_address
+            .iter()
+            .map(|utxo| utxo.txout.value)
+            .sum::<Amount>()
+    }
+
+    fn wait_balance_change(&mut self, address: &Address) -> (Amount, Amount) {
+        let mut balance = self.get_my_balance(&address);
+        let prev = balance;
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+
+            self.sync();
+            balance = self.get_my_balance(address);
+            if balance != prev {
+                break;
+            }
+        }
+
+        (prev, balance)
+    }
 }
+
+// [bdk_wallet/src/wallet/coin_selection.rs at fca652370c466c79659afc6ae57c5015d4007b18 · bitcoindevkit/bdk_wallet](https://github.com/bitcoindevkit/bdk_wallet/blob/fca652370c466c79659afc6ae57c5015d4007b18/src/wallet/coin_selection.rs#L257-L366)

@@ -12,12 +12,6 @@
 ./docker/run-backend.sh
 ```
 
-## Generate to address
-
-```bash
-./docker/bcli.sh generatetoaddress <ADDR> 1
-```
-
 ## Run
 
 ```bash
